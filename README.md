@@ -1,4 +1,4 @@
-# Prediction of MAPK1 Inhibitors by Ensemble Graph Neural Networks for Drug Discovery with Experimental Validation
+# An Ensemble Graph Neural Network Framework for MAPK1 Inhibitor Prediction with Experimental Validation
 
 
 #### Tarapong Srisongkram, Darlene Nabila Zetta, Sastiya Kampaengsri, Natthida Weerapreeyakul
