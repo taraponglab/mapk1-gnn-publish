@@ -1,7 +1,7 @@
 # An Ensemble Graph Neural Network Framework for MAPK1 Inhibitor Prediction with Experimental Validation
 
 
-#### Tarapong Srisongkram, Darlene Nabila Zetta, Sastiya Kampaengsri, Natthida Weerapreeyakul
+#### Tarapong Srisongkram, Darlene Nabila Zetta, Huynh Anh Duy, Sastiya Kampaengsri, Natthida Weerapreeyakul
 
 
 *Division of Pharmaceutical Chemistry, Faculty of Pharmaceutical Sciences, Khon Kaen University, Thailand. (tarasri@kku.ac.th)
