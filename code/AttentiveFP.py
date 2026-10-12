@@ -1,3 +1,9 @@
+"""AttentiveFP: Revision 2 architecture for MAPK1 seeds 111, 222, and 333.
+
+Data are read from data/ and weights from models/, relative to the repository.
+Training occurs only when this script is explicitly run.
+"""
+
 import pandas as pd
 import numpy as np
 import torch
@@ -11,10 +17,17 @@ from torch_geometric.nn import GraphConv, global_mean_pool
 from torch_geometric.nn import AttentiveFP  # Import AttentiveFP from PyTorch Geometric
 from sklearn.metrics import (
     accuracy_score, roc_auc_score, average_precision_score,
-    matthews_corrcoef
+    matthews_corrcoef, recall_score, f1_score, precision_score
 )
 from sklearn.model_selection import train_test_split
-import time  # Import the time module
+import time
+import os
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = PROJECT_ROOT / "data"
+MODEL_DIR = PROJECT_ROOT / "models"
+SEEDS = (111, 222, 333)
 
 
 # --- Atom and Bond Features ---
@@ -43,7 +56,7 @@ def bond_features(bond):
 # --- Convert SMILES to PyG Data object ---
 def mol_to_graph(smiles, label=None):
     mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
+    if mol is None or mol.GetNumAtoms() == 0:
         return None
 
     x = torch.stack([atom_features(atom) for atom in mol.GetAtoms()])
@@ -55,8 +68,9 @@ def mol_to_graph(smiles, label=None):
         feat = bond_features(bond)
         edge_attr += [feat, feat]
 
-    edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
-    edge_attr = torch.stack(edge_attr)
+    # Molecules without bonds still need tensors with the expected dimensions.
+    edge_index = torch.tensor(edge_index, dtype=torch.long).reshape(-1, 2).t().contiguous()
+    edge_attr = torch.stack(edge_attr) if edge_attr else torch.empty((0, 4), dtype=torch.float)
 
     data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
     if label is not None:
@@ -75,25 +89,17 @@ def is_valid_molecule(smiles):
 # --- Load and Preprocess Data ---
 def load_data(file_path, smiles_col, label_col):
     df = pd.read_csv(file_path)
-    df[label_col] = df[label_col].map({"Active": 1, "Inactive": 0})
-    df = df[df[smiles_col].apply(is_valid_molecule)].reset_index(drop=True)
-    df = df.dropna(subset=[smiles_col])
-    return df
-
-
-def split_data(df, smiles_col, label_col):
-    train_val_df, test_df = train_test_split(df, test_size=0.2, stratify=df[label_col], random_state=42)
-    train_df, val_df = train_test_split(train_val_df, test_size=0.2, stratify=train_val_df[label_col], random_state=42)
-    # save train, test, and validation
-    train_df.to_csv("train.csv", index=False)
-    val_df.to_csv("val.csv", index=False)
-    test_df.to_csv("test.csv", index=False)
-    return train_df, val_df, test_df
+    # Keep the SMILES and activity label; PUBCHEM_CID remains in the source CSV.
+    df = df[[smiles_col, label_col]]
+    return df.copy()
 
 
 def convert_to_graphs(df, smiles_col, label_col):
-    df['graph'] = df.apply(lambda row: mol_to_graph(row[smiles_col], row[label_col]), axis=1)
-    return df['graph'].dropna().tolist()
+    graphs = [mol_to_graph(smiles, label) for smiles, label in
+              df[[smiles_col, label_col]].itertuples(index=False, name=None)]
+    if any(graph is None for graph in graphs):
+        raise ValueError('Invalid SMILES found; correct the input before training or evaluation.')
+    return graphs
 
 
 # --- Metrics ---
@@ -104,13 +110,13 @@ def evaluate(model, loader, device):
     with torch.no_grad():
         for batch in loader:
             batch = batch.to(device)
-            
+
             # Pass the required arguments to the model
             logits = model(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
-            
+
             # Reshape logits to match the target shape
             logits = logits.view(-1)  # or logits = logits.squeeze(-1)
-            
+
             y_true.extend(batch.y.view(-1).cpu().numpy())
             y_logits.extend(logits.cpu().numpy())
 
@@ -122,32 +128,45 @@ def evaluate(model, loader, device):
     auc = roc_auc_score(y_true, y_probs)
     auprc = average_precision_score(y_true, y_probs)
     mcc = matthews_corrcoef(y_true, y_pred)
+    recall = recall_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred)
 
-    return acc, auc, auprc, mcc
+    return acc, auc, auprc, mcc, recall, f1, precision
 
+
+output_dir = MODEL_DIR
 
 # --- Main ---
-if __name__ == "__main__":
+def main(seed=111, output_dir=output_dir):
     name = "AttentiveFP"
     print(f"Model: {name}")
+    print(f"Seed: {seed}")
     print("📊 Loading and preprocessing data...\n")
-    
+
     # Start timing the entire process
     start_time = time.time()
-    
+
     # Load and preprocess data
-    file_path = "mapk1_darlene.csv"
-    smiles_col = "SMILES"
-    label_col = "Label"
+    input_path = DATA_DIR
+    smiles_col = "canonical_smiles"
+    label_col = "Class"
 
-    df = load_data(file_path, smiles_col, label_col)
-    print(f"Number of valid SMILES: {len(df)}")
+    train_df = load_data(os.path.join(input_path, f"train_seed_{seed}.csv"), smiles_col, label_col)
+    test_df  = load_data(os.path.join(input_path, f"test_seed_{seed}.csv"), smiles_col, label_col)
+    print(f"📊 Train: {len(train_df)} | Test: {len(test_df)}")
 
-    train_df, val_df, test_df = split_data(df, smiles_col, label_col)
+    #check missing values
+    print(f"📊 Missing values in train_df: {train_df.isnull().sum().sum()}")
+    print(f"📊 Missing values in test_df: {test_df.isnull().sum().sum()}")
+
+    train_df, val_df = train_test_split(train_df, test_size=0.2, random_state=seed)
+
+    print(f"📊 Train: {len(train_df)} | Val: {len(val_df)} | Test: {len(test_df)}")
 
     train_graphs = convert_to_graphs(train_df, smiles_col, label_col)
-    val_graphs = convert_to_graphs(val_df, smiles_col, label_col)
-    test_graphs = convert_to_graphs(test_df, smiles_col, label_col)
+    val_graphs   = convert_to_graphs(val_df, smiles_col, label_col)
+    test_graphs  = convert_to_graphs(test_df, smiles_col, label_col)
 
     print(f"📊 Train: {len(train_graphs)} | Val: {len(val_graphs)} | Test: {len(test_graphs)}")
 
@@ -184,50 +203,58 @@ if __name__ == "__main__":
         for batch in train_loader:
             batch = batch.to(device)
             optimizer.zero_grad()
-            
+
             # Pass the required arguments to the model
             logits = model(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
-            
+
             # Reshape logits to match the target shape
             logits = logits.view(-1)  # or logits = logits.squeeze(-1)
-            
+
             loss = loss_fn(logits, batch.y.view(-1))
             loss.backward()
             optimizer.step()
             total_loss += loss.item() * batch.num_graphs
 
         avg_loss = total_loss / len(train_loader.dataset)
-        acc, auc, auprc, mcc = evaluate(model, val_loader, device)
-        print(f"Epoch {epoch:02d} | Train Loss: {avg_loss:.4f} | Val Acc: {acc:.4f} | AUROC: {auc:.4f} | AUPRC: {auprc:.4f} | MCC: {mcc:.4f} |")
+        acc, auc, auprc, mcc, recall, f1, precision = evaluate(model, val_loader, device)
+        print(f"Epoch {epoch:02d} | Train Loss: {avg_loss:.4f} | Val Acc: {acc:.4f} | AUROC: {auc:.4f} | AUPRC: {auprc:.4f} | MCC: {mcc:.4f} | Recall: {recall:.4f} | F1: {f1:.4f} | Precision: {precision:.4f}")
 
     # Save the model
-    model_save_path = "attentivefp_model.pth"
-    model.load_state_dict(torch.load(model_save_path))
+    model_save_path = os.path.join(output_dir, f"attentivefp_model_seed_{seed}.pth")
+    torch.save(model.state_dict(), model_save_path)
+    print(f"\nModel weights saved to '{model_save_path}'")
+
+    model.load_state_dict(torch.load(model_save_path, map_location=device, weights_only=True))
     print(f"Model weights loaded from '{model_save_path}'")
 
     # Final Test Performance
     print("\n📊 Final Test Set Evaluation")
-    acc, auc, auprc, mcc = evaluate(model, test_loader, device)
+    acc, auc, auprc, mcc, recall, f1, precision = evaluate(model, test_loader, device)
     # Print results in the specified format
-    print(f"[{name},{acc:.4f},{auc:.4f},{auprc:.4f},{mcc:.4f}]")
+    print(f"[{name},{acc:.4f},{auc:.4f},{auprc:.4f},{mcc:.4f},{recall:.4f},{f1:.4f},{precision:.4f}]")
 
     # Append results to result.csv
     result_row = {
         "Model": name,
+        "Seed": seed,
         "Accuracy": round(acc, 3),
         "AUROC": round(auc, 3),
         "AUPRC": round(auprc, 3),
         "MCC": round(mcc, 3),
+        "Recall": round(recall, 3),
+        "F1": round(f1, 3),
+        "Precision": round(precision, 3),
         "Time (s)": round(time.time() - start_time, 2)  # Total time for the run
     }
-    result_file = "result.csv"
+
+    result_file = os.path.join(output_dir, "result.csv")
 
     try:
         # Load existing results if the file exists
         results_df = pd.read_csv(result_file)
     except FileNotFoundError:
         # Create a new DataFrame if the file doesn't exist
-        results_df = pd.DataFrame(columns=["Model", "Accuracy", "AUROC", "AUPRC", "MCC", "Time (s)"])
+        results_df = pd.DataFrame(columns=["Model", "Accuracy", "AUROC", "AUPRC", "MCC", "Recall", "F1", "Precision", "Time (s)"])
 
     # Append the new result and save back to the file
     results_df = pd.concat([results_df, pd.DataFrame([result_row])], ignore_index=True)
@@ -236,3 +263,9 @@ if __name__ == "__main__":
     # Print total runtime
     total_time = time.time() - start_time
     print(f"\nTotal runtime: {total_time:.2f} seconds")
+
+
+if __name__ == "__main__":
+    for seed in SEEDS:
+        main(seed)
+

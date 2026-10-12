@@ -1,3 +1,9 @@
+"""consensus_gnn: Revision 2 architecture for MAPK1 seeds 111, 222, and 333.
+
+Data are read from data/ and weights from models/, relative to the repository.
+Training occurs only when this script is explicitly run.
+"""
+
 import pandas as pd
 import numpy as np
 import torch
@@ -6,12 +12,22 @@ import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GraphConv, global_mean_pool, NNConv, AttentiveFP
-from sklearn.metrics import accuracy_score, roc_auc_score, average_precision_score, matthews_corrcoef, confusion_matrix, ConfusionMatrixDisplay
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier
-import time  # Import the time module
+from sklearn.metrics import (
+    accuracy_score, roc_auc_score, average_precision_score,
+    matthews_corrcoef, recall_score, f1_score, precision_score
+)
+import time
 import matplotlib.pyplot as plt
 from rdkit import Chem
+import joblib
+import os
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = PROJECT_ROOT / "data"
+MODEL_DIR = PROJECT_ROOT / "models"
+SEEDS = (111, 222, 333)
+from sklearn.model_selection import train_test_split
 
 # --- Atom and Bond Features ---
 def atom_features(atom):
@@ -39,7 +55,7 @@ def bond_features(bond):
 # --- Convert SMILES to PyG Data object ---
 def mol_to_graph(smiles, label=None):
     mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
+    if mol is None or mol.GetNumAtoms() == 0:
         return None
 
     x = torch.stack([atom_features(atom) for atom in mol.GetAtoms()])
@@ -51,8 +67,9 @@ def mol_to_graph(smiles, label=None):
         feat = bond_features(bond)
         edge_attr += [feat, feat]
 
-    edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
-    edge_attr = torch.stack(edge_attr)
+    # Molecules without bonds still need tensors with the expected dimensions.
+    edge_index = torch.tensor(edge_index, dtype=torch.long).reshape(-1, 2).t().contiguous()
+    edge_attr = torch.stack(edge_attr) if edge_attr else torch.empty((0, 4), dtype=torch.float)
 
     data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
     if label is not None:
@@ -71,25 +88,16 @@ def is_valid_molecule(smiles):
 # --- Load and Preprocess Data ---
 def load_data(file_path, smiles_col, label_col):
     df = pd.read_csv(file_path)
-    df[label_col] = df[label_col].map({"Active": 1, "Inactive": 0})
-    df = df[df[smiles_col].apply(is_valid_molecule)].reset_index(drop=True)
-    df = df.dropna(subset=[smiles_col])
-    return df
-
-
-def split_data(df, smiles_col, label_col):
-    train_val_df, test_df = train_test_split(df, test_size=0.2, stratify=df[label_col], random_state=42)
-    train_df, val_df = train_test_split(train_val_df, test_size=0.2, stratify=train_val_df[label_col], random_state=42)
-    # save train, test, and validation
-    train_df.to_csv("train.csv", index=False)
-    val_df.to_csv("val.csv", index=False)
-    test_df.to_csv("test.csv", index=False)
-    return train_df, val_df, test_df
-
+    # Keep the SMILES and activity label; PUBCHEM_CID remains in the source CSV.
+    df = df[[smiles_col, label_col]]
+    return df.copy()
 
 def convert_to_graphs(df, smiles_col, label_col):
-    df['graph'] = df.apply(lambda row: mol_to_graph(row[smiles_col], row[label_col]), axis=1)
-    return df['graph'].dropna().tolist()
+    graphs = [mol_to_graph(smiles, label) for smiles, label in
+              df[[smiles_col, label_col]].itertuples(index=False, name=None)]
+    if any(graph is None for graph in graphs):
+        raise ValueError('Invalid SMILES found; correct the input before training or evaluation.')
+    return graphs
 
 
 # --- Metrics ---
@@ -100,13 +108,13 @@ def evaluate(model, loader, device):
     with torch.no_grad():
         for batch in loader:
             batch = batch.to(device)
-            
+
             # Pass the required arguments to the model
             logits = model(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
-            
+
             # Reshape logits to match the target shape
             logits = logits.view(-1)  # or logits = logits.squeeze(-1)
-            
+
             y_true.extend(batch.y.view(-1).cpu().numpy())
             y_logits.extend(logits.cpu().numpy())
 
@@ -118,9 +126,11 @@ def evaluate(model, loader, device):
     auc = roc_auc_score(y_true, y_probs)
     auprc = average_precision_score(y_true, y_probs)
     mcc = matthews_corrcoef(y_true, y_pred)
+    recall = recall_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred)
 
-    return acc, auc, auprc, mcc
-
+    return acc, auc, auprc, mcc, recall, f1, precision
 
 # --- Base Models ---
 class GCNNClassifier(nn.Module):
@@ -156,14 +166,6 @@ class GNNClassifier(nn.Module):
         x = F.relu(self.lin1(x))
         return self.lin2(x).squeeze(1)
 
-# --- Meta Model ---
-class MetaDense(nn.Module):
-    def __init__(self, input_dim):
-        super().__init__()
-        self.fc = nn.Linear(input_dim, 1)
-    def forward(self, x):
-        return self.fc(x).squeeze(1)
-
 # --- Helper: get model predictions as features ---
 def get_model_preds(model, loader, device, is_attentivefp=False):
     model.eval()
@@ -179,50 +181,38 @@ def get_model_preds(model, loader, device, is_attentivefp=False):
             preds.extend(probs)
     return np.array(preds)
 
-# --- Plotting ---
-def plot_confusion_matrix_with_percentages(y_true, y_pred, class_names, name="StackGNN"):
-    cm = confusion_matrix(y_true, y_pred)
-    cm_percent = np.zeros_like(cm, dtype=float)
-    row_sums = cm.sum(axis=1)
-    for i in range(cm.shape[0]):
-        if row_sums[i] > 0:
-            cm_percent[i] = cm[i] / row_sums[i] * 100
-
-    fig, ax = plt.subplots(figsize=(4, 4))
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
-    disp.plot(cmap="Blues", ax=ax, values_format="d", colorbar=False)
-
-    # Add raw numbers and percentages to the confusion matrix
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            ax.text(j, i, f"{cm[i, j]}", ha="center", va="center", color="black", fontsize=10)
-            ax.text(j, i + 0.2, f"({cm_percent[i, j]:.1f}%)", ha="center", va="center", color="black", fontsize=9)
-
-    plt.title(f"Confusion Matrix_{name}", fontsize=12, fontweight="bold", style="italic")
-    plt.xlabel("Predicted values", fontsize=12, fontweight="bold", style="italic")
-    plt.ylabel("True values", fontsize=12, fontweight="bold", style="italic")
-    plt.tight_layout()
-    plt.savefig(f"confusion_matrix_with_{name}.pdf", dpi=500)
-    plt.close()
+output_dir = MODEL_DIR
 
 # --- Main ---
-if __name__ == "__main__":
+def main(seed=111):
     name = "ConsensusGNN"
+    required = [MODEL_DIR / f"{model}_model_seed_{seed}.pth"
+                for model in ("gcnn", "gmnn", "attentivefp")]
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"Missing base weights for seed {seed}: {missing}")
     print(f"Model: {name}")
     print("📊 Loading and preprocessing data...\n")
-    
+
     # Start timing the entire process
     start_time = time.time()
-    
+
     # Load and preprocess data
-    file_path = "mapk1_darlene.csv"
-    smiles_col = "SMILES"
-    label_col = "Label"
+    input_path = DATA_DIR
+    smiles_col = "canonical_smiles"
+    label_col = "Class"
 
-    df = load_data(file_path, smiles_col, label_col)
-    print(f"Number of valid SMILES: {len(df)}")
+    train_df = load_data(os.path.join(input_path, f"train_seed_{seed}.csv"), smiles_col, label_col)
+    test_df  = load_data(os.path.join(input_path, f"test_seed_{seed}.csv"), smiles_col, label_col)
+    print(f"📊 Train: {len(train_df)} | Test: {len(test_df)}")
 
-    train_df, val_df, test_df = split_data(df, smiles_col, label_col)
+    #check missing values
+    print(f"📊 Missing values in train_df: {train_df.isnull().sum().sum()}")
+    print(f"📊 Missing values in test_df: {test_df.isnull().sum().sum()}")
+
+    train_df, val_df = train_test_split(train_df, test_size=0.2, random_state=seed)
+
+    print(f"📊 Train: {len(train_df)} | Val: {len(val_df)} | Test: {len(test_df)}")
 
     train_graphs = convert_to_graphs(train_df, smiles_col, label_col)
     val_graphs = convert_to_graphs(val_df, smiles_col, label_col)
@@ -242,11 +232,11 @@ if __name__ == "__main__":
 
     # --- Load pretrained base models ---
     gcnn = GCNNClassifier(node_dim).to(device)
-    gcnn.load_state_dict(torch.load("gcnn_model.pth", map_location=device))
+    gcnn.load_state_dict(torch.load(os.path.join(output_dir,f"gcnn_model_seed_{seed}.pth"), map_location=device, weights_only=True))
     gcnn.eval()
 
     gnn = GNNClassifier(node_dim, edge_dim).to(device)
-    gnn.load_state_dict(torch.load("gnn_model.pth", map_location=device))
+    gnn.load_state_dict(torch.load(os.path.join(output_dir,f"gmnn_model_seed_{seed}.pth"), map_location=device, weights_only=True))
     gnn.eval()
 
     attentivefp = AttentiveFP(
@@ -257,20 +247,20 @@ if __name__ == "__main__":
         num_layers=3,
         num_timesteps=2
     ).to(device)
-    attentivefp.load_state_dict(torch.load("attentivefp_model.pth", map_location=device))
+    attentivefp.load_state_dict(torch.load(os.path.join(output_dir,f"attentivefp_model_seed_{seed}.pth"), map_location=device, weights_only=True))
     attentivefp.eval()
 
     # Train
-    gcnn_preds = get_model_preds(gcnn, train_loader, device).flatten()
-    gnn_preds = get_model_preds(gnn, train_loader, device).flatten()
-    attfp_preds = get_model_preds(attentivefp, train_loader, device, is_attentivefp=True).flatten()
-    train_preds = np.stack([gcnn_preds, gnn_preds, attfp_preds], axis=1)
-
-    # Validation
-    gcnn_val_preds = get_model_preds(gcnn, val_loader, device).flatten()
-    gnn_val_preds = get_model_preds(gnn, val_loader, device).flatten()
-    attfp_val_preds = get_model_preds(attentivefp, val_loader, device, is_attentivefp=True).flatten()
-    val_preds = np.stack([gcnn_val_preds, gnn_val_preds, attfp_val_preds], axis=1)
+    #gcnn_preds = get_model_preds(gcnn, train_loader, device).flatten()
+    #gnn_preds = get_model_preds(gnn, train_loader, device).flatten()
+    #attfp_preds = get_model_preds(attentivefp, train_loader, device, is_attentivefp=True).flatten()
+    #train_preds = np.stack([gcnn_preds, gnn_preds, attfp_preds], axis=1)
+#
+    ## Validation
+    #gcnn_val_preds = get_model_preds(gcnn, val_loader, device).flatten()
+    #gnn_val_preds = get_model_preds(gnn, val_loader, device).flatten()
+    #attfp_val_preds = get_model_preds(attentivefp, val_loader, device, is_attentivefp=True).flatten()
+    #val_preds = np.stack([gcnn_val_preds, gnn_val_preds, attfp_val_preds], axis=1)
 
     # Test
     gcnn_test_preds = get_model_preds(gcnn, test_loader, device).flatten()
@@ -278,42 +268,79 @@ if __name__ == "__main__":
     attfp_test_preds = get_model_preds(attentivefp, test_loader, device, is_attentivefp=True).flatten()
     test_preds = np.stack([gcnn_test_preds, gnn_test_preds, attfp_test_preds], axis=1)
 
-    y_train = train_df["Label"].values.astype(np.float32)
-    y_val = val_df["Label"].values.astype(np.float32)
-    y_test = test_df["Label"].values.astype(np.float32)
+    #y_train = train_df[label_col].values.astype(np.float32)
+    #y_val = val_df[label_col].values.astype(np.float32)
+    y_test = test_df[label_col].values.astype(np.float32)
 
-    # 3. Consensus (average) ensemble
-    probs = np.mean([gcnn_test_preds, gnn_test_preds, attfp_test_preds], axis=0)
+    # ------------------------------------------------------------------------------
+    # 3. Consensus by Average
+    # ------------------------------------------------------------------------------
+    # หาค่าเฉลี่ยของ y_pred (Probability) จากทั้ง 3 โมเดลในแนวแกนแถว (axis=1) ของทุกชุดข้อมูล
+    #train_avg_prob = train_preds.mean(axis=1)
+    #val_avg_prob   = val_preds.mean(axis=1)
+    test_avg_prob  = test_preds.mean(axis=1)
+
+    # หากค่าเฉลี่ย >= 0.5 ให้เป็นคลาส 1 (Active) นอกนั้นเป็น 0 (Inactive)
+    #train_consensus_pred = (train_avg_prob >= 0.5).astype(int)
+    #val_consensus_pred   = (val_avg_prob >= 0.5).astype(int)
+    test_consensus_pred  = (test_avg_prob >= 0.5).astype(int)
+
+    # พรินต์สมการ Consensus สรุปภาพรวม
+    equation = "y_pred_final = 1 if (mean(GCNN + GMNN + AttentiveFP) >= 0.5) else 0"
+    print("\nConsensus System (Simple Average):")
+    print(equation)
+
+    # บันทึกผลลัพธ์ลงไฟล์สำหรับแต่ละ seed
+    output_txt_path = os.path.join(output_dir, 'consensus_summary.txt')
+    with open(output_txt_path, 'a', encoding='utf-8') as f:
+        f.write(f"Seed {seed}: {equation}\n")
+
+    # ------------------------------------------------------------------------------
+    # 4. Evaluate Consensus on Test Set
+    # ------------------------------------------------------------------------------
+    # ใช้ค่าความน่าจะเป็นเฉลี่ย (test_avg_prob) และคลาสที่ทำนายได้จาก Consensus (test_consensus_pred)
+    probs = test_avg_prob
+    y_pred = test_consensus_pred
     y_pred = (probs >= 0.5).astype(int)
+
+
     acc = accuracy_score(y_test, y_pred)
     auc = roc_auc_score(y_test, probs)
     auprc = average_precision_score(y_test, probs)
     mcc = matthews_corrcoef(y_test, y_pred)
-    print(f"\nConsensus Ensemble Test Performance: Acc={acc:.4f}, AUROC={auc:.4f}, AUPRC={auprc:.4f}, MCC={mcc:.4f}")
-
-    # Save the consensus probabilities if needed
-    np.save("consensus_probs.npy", probs)
+    recall = recall_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred)
+    print(f"\nConsensus Test Performance: Acc={acc:.4f}, AUROC={auc:.4f}, AUPRC={auprc:.4f}, MCC={mcc:.4f}, Recall={recall:.4f}, F1={f1:.4f}, Precision={precision:.4f}")
 
     # Final Test Performance
     print("\n📊 Final Test Set Evaluation")
-    print(f"[ConsensusGNN,{acc:.4f},{auc:.4f},{auprc:.4f},{mcc:.4f}]")
+    print(f"[{name},{acc:.4f},{auc:.4f},{auprc:.4f},{mcc:.4f}, {recall:.4f},{f1:.4f},{precision:.4f}]")
 
     # Append results to result.csv
     result_row = {
-        "Model": "ConsensusGNN",
+        "Model": name,
+        "Seed": seed,
         "Accuracy": round(acc, 3),
         "AUROC": round(auc, 3),
         "AUPRC": round(auprc, 3),
         "MCC": round(mcc, 3),
+        "Recall": round(recall, 3),
+        "F1": round(f1, 3),
+        "Precision": round(precision, 3),
         "Time (s)": round(time.time() - start_time, 2)  # Total time for the run
     }
-    result_file = "result.csv"
+
+    result_file = os.path.join(output_dir, "result.csv")
 
     try:
-        results_df = pd.read_csv(result_file)
+        # Load existing results if the file exists
+        results_df = pd.read_csv(result_file).reindex(columns=list(result_row))
     except FileNotFoundError:
-        results_df = pd.DataFrame(columns=["Model", "Accuracy", "AUROC", "AUPRC", "MCC", "Time (s)"])
+        # Create a new DataFrame if the file doesn't exist
+        results_df = pd.DataFrame(columns=list(result_row))
 
+    # Append the new result and save back to the file
     results_df = pd.concat([results_df, pd.DataFrame([result_row])], ignore_index=True)
     results_df.to_csv(result_file, index=False)
 
@@ -321,10 +348,8 @@ if __name__ == "__main__":
     total_time = time.time() - start_time
     print(f"\nTotal runtime: {total_time:.2f} seconds")
 
-    # Plot Confusion Matrix for test set
-    plot_confusion_matrix_with_percentages(
-        y_true=y_test,
-        y_pred=y_pred,
-        class_names=["Inactive", "Active"],
-        name="ConsensusGNN"
-    )
+
+if __name__ == "__main__":
+    for seed in SEEDS:
+        print(seed)
+        main(seed)
